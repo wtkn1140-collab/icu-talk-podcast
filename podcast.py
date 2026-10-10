@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+"""YouTubeチャンネルをポッドキャスト化する。
+
+取得は Mac（launchd で定期実行）、配信は GitHub。
+音声ファイルは音声専用リポジトリ（audio-site/ に clone）の GitHub Pages、
+フィード(docs/feed.xml) とWebプレーヤー(docs/index.html) はこのリポジトリの GitHub Pages で配信する。
+（GitHub Release は application/octet-stream で返すため Apple Podcasts で再生できない）
+（YouTube が GitHub のサーバーからの取得をボット判定で拒否するため、取得は自宅回線で行う）
+
+  python3 podcast.py update [--limit 10] [--keep 15] [--no-upload]
+"""
+import argparse
+import email.utils
+import html
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.request
+from datetime import datetime, timezone
+
+CHANNEL_URL = "https://www.youtube.com/channel/UCmP6AkeW0xv4ol8EPOu5gfg/videos"
+SHOW_TITLE = "ICUトーク"
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+WORK_DIR = os.path.join(ROOT, "work")
+DOCS = os.path.join(ROOT, "docs")
+DB_PATH = os.path.join(DOCS, "episodes.json")
+YTDLP = os.path.join(ROOT, "bin", "yt-dlp")
+GH = os.path.join(ROOT, "bin", "gh")
+YTDLP_BASE = [YTDLP, "--js-runtimes", "node", "--no-warnings", "--retries", "10"]
+
+REPO = "wtkn1140-collab/icu-talk-podcast"
+UPLOAD = True
+OWNER, NAME = REPO.split("/", 1)
+PAGES_URL = "https://{}.github.io/{}/".format(OWNER.lower(), NAME)
+AUDIO_REPO = REPO + "-audio"
+AUDIO_SITE = os.path.join(ROOT, "audio-site")
+AUDIO_BASE = "https://{}.github.io/{}/".format(OWNER.lower(), AUDIO_REPO.split("/", 1)[1])
+MAX_FILE_SIZE = 95 * 1024 * 1024       # GitHub は 100MB を超えるファイルを push できない
+HISTORY_RESET_SIZE = 1500 * 1024 * 1024  # 音声リポジトリの履歴がこれを超えたら作り直す
+
+
+def load_db():
+    if os.path.exists(DB_PATH):
+        with open(DB_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save_db(db):
+    with open(DB_PATH, "w", encoding="utf-8") as f:
+        json.dump(db, f, ensure_ascii=False, indent=1)
+
+
+def gh(*args, check=True):
+    return subprocess.run([GH] + list(args), capture_output=True, text=True, check=check)
+
+
+def list_channel(limit):
+    out = subprocess.run(
+        YTDLP_BASE + ["--flat-playlist", "--playlist-end", str(limit),
+                      "--print", "%(id)s\t%(title)s", CHANNEL_URL],
+        capture_output=True, text=True, check=True).stdout
+    return [line.split("\t", 1) for line in out.splitlines() if "\t" in line]
+
+
+def remux_m4a(path):
+    """YouTubeのDASH形式m4aはApple Podcastsで再生できないので、再エンコードせず通常のm4aに詰め替える。"""
+    tmp = path + ".remux.m4a"
+    r = subprocess.run(["avconvert", "--preset", "PresetPassthrough", "--source", path,
+                        "--output", tmp, "--replace"], capture_output=True, text=True)
+    if r.returncode == 0 and os.path.exists(tmp):
+        os.replace(tmp, path)
+    else:
+        print("   m4aの詰め替えに失敗:", r.stderr.strip() or r.stdout.strip())
+
+
+def download(vid):
+    """音声を work/ep-<id>.m4a に取得してメタデータを返す。YouTube側が不安定なので数回試す。"""
+    url = "https://www.youtube.com/watch?v=" + vid
+    stem = "ep-" + vid  # 先頭が "-" のIDがあるので接頭辞を付ける
+    info_path = os.path.join(WORK_DIR, stem + ".info.json")
+    for attempt in range(4):
+        r = subprocess.run(
+            YTDLP_BASE + ["-f", "ba[ext=m4a]/ba", "--write-info-json",
+                          "-o", os.path.join(WORK_DIR, stem + ".%(ext)s"), "--", vid],
+            capture_output=True, text=True)
+        audio = [f for f in os.listdir(WORK_DIR)
+                 if f.startswith(stem + ".") and f.endswith((".m4a", ".webm", ".mp4"))]
+        if r.returncode == 0 and audio and os.path.exists(info_path):
+            break
+        print("   再試行 ({}/3): {}".format(attempt + 1, (r.stderr.strip().splitlines() or [""])[-1]))
+        time.sleep(5)
+    else:
+        return None
+    with open(info_path, encoding="utf-8") as f:
+        info = json.load(f)
+    os.remove(info_path)
+    fname = audio[0]
+    if fname.endswith(".m4a"):
+        remux_m4a(os.path.join(WORK_DIR, fname))
+    return {
+        "id": vid,
+        "title": info.get("title", vid),
+        "description": info.get("description", ""),
+        "upload_date": info.get("upload_date", ""),
+        "timestamp": info.get("timestamp"),
+        "duration": info.get("duration") or 0,
+        "thumbnail": info.get("thumbnail", ""),
+        "file": fname,
+        "size": os.path.getsize(os.path.join(WORK_DIR, fname)),
+        "mime": "audio/mp4" if fname.endswith((".m4a", ".mp4")) else "audio/webm",
+    }
+
+
+def publish_audio(ep):
+    path = os.path.join(WORK_DIR, ep["file"])
+    if not UPLOAD:
+        print("   （--no-upload のためアップロードは省略）")
+        return True
+    if ep["size"] > MAX_FILE_SIZE:
+        print("   100MB近いため公開できません（GitHubの上限）")
+        os.remove(path)
+        return False
+    os.replace(path, os.path.join(AUDIO_SITE, ep["file"]))  # push は push_audio() でまとめて行う
+    return True
+
+
+def ensure_audio_site():
+    if UPLOAD and not os.path.isdir(os.path.join(AUDIO_SITE, ".git")):
+        git("clone", "https://github.com/{}.git".format(AUDIO_REPO), AUDIO_SITE)
+
+
+def sorted_episodes(db):
+    return sorted(db.values(), key=lambda e: (e.get("upload_date", ""), e.get("timestamp") or 0),
+                  reverse=True)
+
+
+def pub_date(ep):
+    if ep.get("timestamp"):
+        dt = datetime.fromtimestamp(ep["timestamp"], timezone.utc)
+    elif ep.get("upload_date"):
+        dt = datetime.strptime(ep["upload_date"], "%Y%m%d").replace(tzinfo=timezone.utc)
+    else:
+        dt = datetime.now(timezone.utc)
+    return email.utils.format_datetime(dt)
+
+
+def hms(sec):
+    sec = int(sec or 0)
+    return "{}:{:02d}:{:02d}".format(sec // 3600, sec % 3600 // 60, sec % 60)
+
+
+def write_feed(db):
+    esc = html.escape
+    eps = sorted_episodes(db)
+    items = []
+    for ep in eps:
+        items.append("""  <item>
+    <title>{t}</title>
+    <guid isPermaLink="false">yt:{id}</guid>
+    <link>https://www.youtube.com/watch?v={id}</link>
+    <pubDate>{d}</pubDate>
+    <description>{desc}</description>
+    <enclosure url="{url}" length="{size}" type="{mime}"/>
+    <itunes:duration>{dur}</itunes:duration>
+    <itunes:image href="{img}"/>
+  </item>""".format(t=esc(ep["title"]), id=ep["id"], d=pub_date(ep), desc=esc(ep["description"]),
+                    url=AUDIO_BASE + ep["file"], size=ep["size"], mime=ep["mime"],
+                    dur=hms(ep["duration"]), img=esc(ep["thumbnail"])))
+    feed = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
+<channel>
+  <title>{title}</title>
+  <link>{ch}</link>
+  <language>ja</language>
+  <description>YouTube「ICU Talk」の音声を個人用にポッドキャスト化したフィード</description>
+  <itunes:author>小林宏維・小谷祐樹</itunes:author>
+  <itunes:category text="Health &amp; Fitness"><itunes:category text="Medicine"/></itunes:category>
+  <itunes:explicit>false</itunes:explicit>
+  <itunes:image href="{img}"/>
+{items}
+</channel>
+</rss>
+""".format(title=esc(SHOW_TITLE), ch=esc(CHANNEL_URL),
+           img=esc(PAGES_URL + "cover.jpg"), items="\n".join(items))
+    with open(os.path.join(DOCS, "feed.xml"), "w", encoding="utf-8") as f:
+        f.write(feed)
+
+
+def write_player(db):
+    eps = []
+    for ep in sorted_episodes(db):
+        e = {k: ep[k] for k in ("id", "title", "upload_date", "duration", "thumbnail")}
+        e["url"] = AUDIO_BASE + ep["file"]
+        eps.append(e)
+    with open(os.path.join(ROOT, "player_template.html"), encoding="utf-8") as f:
+        tpl = f.read()
+    page = (tpl.replace("__TITLE__", html.escape(SHOW_TITLE))
+               .replace("__FEED_URL__", PAGES_URL + "feed.xml")
+               .replace("__EPISODES__", json.dumps(eps, ensure_ascii=False).replace("</", "<\\/")))
+    with open(os.path.join(DOCS, "index.html"), "w", encoding="utf-8") as f:
+        f.write(page)
+
+
+def prune(db, keep):
+    for ep in sorted_episodes(db)[keep:]:
+        print(" 🗑 古い回を削除:", ep["title"])
+        path = os.path.join(AUDIO_SITE, ep["file"])
+        if UPLOAD and os.path.exists(path):
+            os.remove(path)
+        del db[ep["id"]]
+
+
+def git(*args, cwd=ROOT):
+    helper = "!'{}' auth git-credential".format(GH)
+    return subprocess.run(["git", "-c", "credential.helper=", "-c", "credential.helper=" + helper] + list(args),
+                          cwd=cwd, capture_output=True, text=True, env=dict(os.environ, GIT_TERMINAL_PROMPT="0"))
+
+
+def dir_size(path):
+    return sum(os.path.getsize(os.path.join(d, f)) for d, _, files in os.walk(path) for f in files)
+
+
+def push_audio():
+    git("add", "-A", cwd=AUDIO_SITE)
+    if git("diff", "--cached", "--quiet", cwd=AUDIO_SITE).returncode == 0:
+        return
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    if dir_size(os.path.join(AUDIO_SITE, ".git")) > HISTORY_RESET_SIZE:
+        # 削除済みの古い音声が履歴に溜まったので、今あるファイルだけの履歴に作り直す
+        print("音声リポジトリの履歴を整理します")
+        git("checkout", "--orphan", "fresh", cwd=AUDIO_SITE)
+        git("commit", "-m", "音声ファイル（履歴を整理） " + stamp, cwd=AUDIO_SITE)
+        git("branch", "-D", "main", cwd=AUDIO_SITE)
+        git("branch", "-m", "main", cwd=AUDIO_SITE)
+        r = git("push", "--force", "origin", "main", cwd=AUDIO_SITE)
+        git("gc", "--prune=now", cwd=AUDIO_SITE)
+    else:
+        git("commit", "-m", "音声更新 " + stamp, cwd=AUDIO_SITE)
+        r = git("push", "origin", "main", cwd=AUDIO_SITE)
+    print("音声をGitHubへ反映しました" if r.returncode == 0 else "音声のpush失敗: " + r.stderr.strip())
+
+
+def push_docs():
+    git("add", "docs")
+    if git("diff", "--cached", "--quiet").returncode == 0:
+        return
+    git("commit", "-m", "エピソード更新 " + datetime.now().strftime("%Y-%m-%d %H:%M"))
+    r = git("push", "origin", "main")
+    print("GitHubへ反映しました" if r.returncode == 0 else "push失敗: " + r.stderr.strip())
+
+
+def ensure_cover():
+    """番組のカバーアートとしてチャンネルのアイコン画像を docs/cover.jpg に保存する（初回のみ）。"""
+    path = os.path.join(DOCS, "cover.jpg")
+    if os.path.exists(path):
+        return
+    out = subprocess.run(
+        YTDLP_BASE + ["--flat-playlist", "--playlist-items", "0", "-J", CHANNEL_URL.rsplit("/", 1)[0]],
+        capture_output=True, text=True)
+    thumbs = json.loads(out.stdout).get("thumbnails", []) if out.returncode == 0 else []
+    avatar = [t for t in thumbs if t.get("id") == "avatar_uncropped"]
+    if avatar:
+        urllib.request.urlretrieve(avatar[0]["url"], path)
+        # 取得できる画像はPNGのことがあるので、Apple Podcasts向けに本物のJPEGにする
+        subprocess.run(["sips", "-s", "format", "jpeg", path, "--out", path], capture_output=True)
+    else:
+        print("   チャンネルアイコンを取得できませんでした")
+
+
+def cmd_update(args):
+    global UPLOAD
+    UPLOAD = not args.no_upload
+    subprocess.run([YTDLP, "-U"], capture_output=True)  # YouTube側の仕様変更に追従
+    os.makedirs(WORK_DIR, exist_ok=True)
+    os.makedirs(DOCS, exist_ok=True)
+    ensure_audio_site()
+    ensure_cover()
+    db = load_db()
+    print("チャンネルの新着を確認中…")
+    videos = list_channel(args.limit)
+    new = [(vid, title) for vid, title in videos if vid not in db]
+    print("新着 {} 件（確認した {} 件中）".format(len(new), len(videos)))
+    failed = 0
+    for vid, title in new:
+        print(" ↓", title)
+        ep = download(vid)
+        if ep and publish_audio(ep):
+            db[vid] = ep
+            save_db(db)
+        else:
+            failed += 1
+            print("   取得失敗。次回の実行で再試行します")
+    if args.keep and len(db) > args.keep:
+        prune(db, args.keep)
+    save_db(db)
+    write_feed(db)
+    write_player(db)
+    if UPLOAD:
+        push_audio()
+        push_docs()
+    print("完了: {} エピソード / フィード: {}feed.xml".format(len(db), PAGES_URL))
+    return 1 if new and failed == len(new) else 0
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    u = sub.add_parser("update", help="新着を取得して公開")
+    u.add_argument("--limit", type=int, default=10, help="チャンネルの最新何件を対象にするか")
+    u.add_argument("--keep", type=int, default=15, help="公開しておく最大件数（0=無制限）")
+    u.add_argument("--no-upload", action="store_true", help="GitHubへ公開せず手元で試すだけ")
+    args = p.parse_args()
+    return cmd_update(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
